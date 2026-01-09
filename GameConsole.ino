@@ -9,18 +9,19 @@
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // ===================== Pins =====================
-// Pots (you said ADC on 1 & 2)
-const int POT_LEFT_PIN   = 1;   // GPIO1 = A1 (ADC)  (Flappy uses this)
-const int POT_RIGHT_PIN  = 2;   // GPIO2 = A2 (ADC)  (Pong right paddle)
-const int START_BTN_PIN  = 20;  // GPIO20, button to GND (INPUT_PULLUP)
+// Pots (ADC on 1 & 2)
+const int POT_LEFT_PIN   = 1;   // GPIO1 (ADC)  (Pong left paddle, Flappy optional)
+const int POT_RIGHT_PIN  = 2;   // GPIO2 (ADC)  (Pong right paddle)
 
-// ===================== Common input tuning =====================
-static const int ADC_MAX_ASSUMED = 4095;     // we still map with calibration where needed
-static const int DEAD_BAND = 10;             // reduce tiny jitter
-static const int POT_DELTA_TRIGGER = 500;    // Flappy jump threshold
-static const unsigned long FLAP_COOLDOWN_MS = 180;
+// Buttons
+const int START_BTN_PIN  = 20;  // "BACK / MENU"
+const int SELECT_BTN_PIN = 19;  // "SELECT / ACTION"
 
-// ===================== Button events (short/long) =====================
+// ===================== Input tuning =====================
+static const int DEAD_BAND = 10;        // reduce tiny jitter
+static const int ADC_MAX_REAL = 3400;   // you reported ~3400 max (adjust if needed)
+
+// ===================== Button events =====================
 enum BtnEvent { BTN_NONE, BTN_SHORT, BTN_LONG };
 
 struct Button {
@@ -47,32 +48,30 @@ struct Button {
     bool raw = digitalRead(pin); // HIGH idle, LOW pressed
     unsigned long now = millis();
 
-    // debounce input
+    // debounce
     if (raw != lastRaw) {
       lastRaw = raw;
       lastChangeMs = now;
     }
     if (now - lastChangeMs < DEBOUNCE_MS) return BTN_NONE;
 
-    // stable state changed?
+    // stable changed?
     if (stable != raw) {
       stable = raw;
 
       if (stable == LOW) {
-        // pressed
         isDown = true;
         longFired = false;
         downStartMs = now;
       } else {
-        // released
         if (isDown) {
           isDown = false;
-          if (!longFired) ev = BTN_SHORT;  // only short if long wasn't fired
+          if (!longFired) ev = BTN_SHORT;
         }
       }
     }
 
-    // long press fires immediately when threshold is crossed
+    // long fires immediately (no need to release)
     if (isDown && !longFired && (now - downStartMs >= LONG_MS)) {
       longFired = true;
       ev = BTN_LONG;
@@ -82,7 +81,8 @@ struct Button {
   }
 };
 
-Button btn;
+Button btnStart;
+Button btnSelect;
 
 // ===================== App state =====================
 enum ScreenState { MAIN_MENU, GAME_MENU, IN_GAME };
@@ -92,11 +92,10 @@ ScreenState screenState = MAIN_MENU;
 GameId selectedGame = GAME_PONG;
 GameId activeGame = GAME_PONG;
 
-// Pots raw (kept globally)
+// ===================== Pots =====================
 int rawL = 0;
 int rawR = 0;
 
-// Deadband helper
 int applyDeadband(int v, int &last) {
   if (last < 0) { last = v; return v; }
   if (abs(v - last) < DEAD_BAND) return last;
@@ -117,13 +116,11 @@ int pongLeftY  = (SCREEN_HEIGHT - PADDLE_H) / 2;
 int pongRightY = (SCREEN_HEIGHT - PADDLE_H) / 2;
 int pongScoreL = 0, pongScoreR = 0;
 
-// Pong pot calibration (so paddles reach bottom even if max is ~3400)
-int pongMinL = 4095, pongMaxL = 0;
-int pongMinR = 4095, pongMaxR = 0;
+int mapPotToPaddleFixed(int v) {
+  if (v < 0) v = 0;
+  if (v > ADC_MAX_REAL) v = ADC_MAX_REAL;
 
-int mapPotToPaddle(int v, int vmin, int vmax) {
-  if (vmax - vmin < 50) return (SCREEN_HEIGHT - PADDLE_H) / 2;
-  long y = map(v, vmin, vmax, 0, SCREEN_HEIGHT - PADDLE_H);
+  long y = map(v, 0, ADC_MAX_REAL, 0, SCREEN_HEIGHT - PADDLE_H);
   if (y < 0) y = 0;
   if (y > SCREEN_HEIGHT - PADDLE_H) y = SCREEN_HEIGHT - PADDLE_H;
   return (int)y;
@@ -133,7 +130,7 @@ void pongResetBall(bool toRight) {
   pongBallX = SCREEN_WIDTH / 2.0f;
   pongBallY = SCREEN_HEIGHT / 2.0f;
 
-  float speedX = 1.9f; // change ball speed here
+  float speedX = 1.9f; // ball speed
   float speedY = 1.2f;
 
   pongVX = toRight ? speedX : -speedX;
@@ -144,10 +141,6 @@ void pongStartNewGame() {
   pongScoreL = pongScoreR = 0;
   pongLeftY  = (SCREEN_HEIGHT - PADDLE_H) / 2;
   pongRightY = (SCREEN_HEIGHT - PADDLE_H) / 2;
-
-  pongMinL = 4095; pongMaxL = 0;
-  pongMinR = 4095; pongMaxR = 0;
-
   pongResetBall(true);
 }
 
@@ -161,33 +154,27 @@ void pongBounce(int paddleY, bool isRight) {
   pongVX = -pongVX;
   pongVY = rel * 2.2f;
 
-  // optional speed-up
-  pongVX *= 1.02f;
+  // optional slight speed-up:
+  pongVX *= 1.01f;
 
   if (isRight) pongBallX = RIGHT_X - BALL_SIZE - 1;
   else         pongBallX = LEFT_X + PADDLE_W + 1;
 }
 
 void pongUpdate() {
-  // Calibrate pot ranges
-  if (rawL < pongMinL) pongMinL = rawL;
-  if (rawL > pongMaxL) pongMaxL = rawL;
-  if (rawR < pongMinR) pongMinR = rawR;
-  if (rawR > pongMaxR) pongMaxR = rawR;
+  // paddles from pots (fixed mapping so you reach top/bottom immediately)
+  pongLeftY  = mapPotToPaddleFixed(rawL);
+  pongRightY = mapPotToPaddleFixed(rawR);
 
-  // Move paddles
-  pongLeftY  = mapPotToPaddle(rawL, pongMinL, pongMaxL);
-  pongRightY = mapPotToPaddle(rawR, pongMinR, pongMaxR);
-
-  // Move ball
+  // ball
   pongBallX += pongVX;
   pongBallY += pongVY;
 
-  // Walls
+  // walls
   if (pongBallY <= 0) { pongBallY = 0; pongVY = -pongVY; }
   if (pongBallY >= SCREEN_HEIGHT - BALL_SIZE) { pongBallY = SCREEN_HEIGHT - BALL_SIZE; pongVY = -pongVY; }
 
-  // Paddle collisions
+  // left paddle
   if (pongVX < 0 &&
       pongBallX <= (LEFT_X + PADDLE_W) &&
       (pongBallY + BALL_SIZE) >= pongLeftY &&
@@ -195,6 +182,7 @@ void pongUpdate() {
     pongBounce(pongLeftY, false);
   }
 
+  // right paddle
   if (pongVX > 0 &&
       (pongBallX + BALL_SIZE) >= RIGHT_X &&
       (pongBallY + BALL_SIZE) >= pongRightY &&
@@ -202,7 +190,7 @@ void pongUpdate() {
     pongBounce(pongRightY, true);
   }
 
-  // Scoring
+  // score
   if (pongBallX < -10) { pongScoreR++; pongResetBall(true); }
   if (pongBallX > SCREEN_WIDTH + 10) { pongScoreL++; pongResetBall(false); }
 }
@@ -210,107 +198,81 @@ void pongUpdate() {
 void pongRender() {
   display.clearDisplay();
 
-  // Scores
   display.setTextSize(1);
   display.setCursor(40, 0); display.print(pongScoreL);
   display.setCursor(82, 0); display.print(pongScoreR);
 
-  // Center line
   for (int y = 0; y < SCREEN_HEIGHT; y += 6) {
     display.drawFastVLine(SCREEN_WIDTH / 2, y, 3, SSD1306_WHITE);
   }
 
-  // Paddles
   display.fillRect(LEFT_X, pongLeftY, PADDLE_W, PADDLE_H, SSD1306_WHITE);
   display.fillRect(RIGHT_X, pongRightY, PADDLE_W, PADDLE_H, SSD1306_WHITE);
 
-  // Ball
   display.fillRect((int)pongBallX, (int)pongBallY, BALL_SIZE, BALL_SIZE, SSD1306_WHITE);
 
   display.display();
 }
 
-// ===================== Flappy Bird (pot-jump) =====================
+// ===================== Flappy (SELECT to flap) =====================
 struct Flappy {
   float birdY = 28;
   float vel = 0;
   int score = 0;
 
-  // Bird
   static const int BIRD_X = 28;
   static const int BIRD_SIZE = 4;
 
-  // Physics
   float gravity = 0.35f;
-  float flapVel = -3.6f;
+  float flapVel = -3.8f;
 
-  // Pipes
   static const int PIPE_W = 10;
   static const int GAP_H  = 20;
+
   int pipeX1 = 128;
   int pipeX2 = 128 + 64;
-  int gapY1 = 22;
-  int gapY2 = 30;
+  int gapY1 = 30;
+  int gapY2 = 26;
 
   bool passed1 = false;
   bool passed2 = false;
-
-  // Pot trigger
-  int lastPot = -1;
-  unsigned long lastFlapMs = 0;
 
   void reset() {
     birdY = 28;
     vel = 0;
     score = 0;
+
     pipeX1 = 128;
     pipeX2 = 128 + 64;
-    gapY1 = 18 + (random(0, 28)); // keeps gap inside 64px
-    gapY2 = 18 + (random(0, 28));
+
+    int minC = (GAP_H / 2) + 6;
+    int maxC = SCREEN_HEIGHT - (GAP_H / 2) - 6;
+    gapY1 = random(minC, maxC + 1);
+    gapY2 = random(minC, maxC + 1);
+
     passed1 = passed2 = false;
-    lastPot = -1;
-    lastFlapMs = 0;
   }
 
-  void flapIfPotMoved(int potVal) {
-    unsigned long now = millis();
+  void flap() { vel = flapVel; }
 
-    if (lastPot < 0) {  // first sample
-      lastPot = potVal;
-      return;
-    }
-
-    int d = abs(potVal - lastPot);
-
-    // Always update lastPot every frame (so delta is between consecutive samples)
-    lastPot = potVal;
-
-    if (d >= POT_DELTA_TRIGGER && (now - lastFlapMs) >= FLAP_COOLDOWN_MS) {
-      vel = flapVel;          // jump
-      lastFlapMs = now;
-    }
-  }
-
-
-  void stepPipes(int &pipeX, int &gapY, bool &passed) {
+  void stepPipe(int &pipeX, int &gapY, bool &passed) {
     pipeX -= 2;
     if (pipeX < -PIPE_W) {
       pipeX = SCREEN_WIDTH;
-      gapY = 18 + random(0, 28);
+      int minC = (GAP_H / 2) + 6;
+      int maxC = SCREEN_HEIGHT - (GAP_H / 2) - 6;
+      gapY = random(minC, maxC + 1);
       passed = false;
     }
   }
 
   bool collidePipe(int pipeX, int gapY) {
-    // Pipe body rectangles (top and bottom)
     int topH = gapY - (GAP_H / 2);
     int botY = gapY + (GAP_H / 2);
-    int botH = SCREEN_HEIGHT - botY;
 
     int bx = BIRD_X;
     int by = (int)birdY;
 
-    // Bird AABB
     int bL = bx;
     int bR = bx + BIRD_SIZE;
     int bT = by;
@@ -319,41 +281,30 @@ struct Flappy {
     int pL = pipeX;
     int pR = pipeX + PIPE_W;
 
-    // If x overlaps pipe
     if (bR >= pL && bL <= pR) {
-      // collide with top pipe
       if (bT < topH) return true;
-      // collide with bottom pipe
       if (bB > botY) return true;
     }
     return false;
   }
 
-  void update(int potVal) {
-    // Pot-controlled flap
-    flapIfPotMoved(potVal);
-
-    // Physics
+  void update() {
     vel += gravity;
     birdY += vel;
 
-    // Pipes
-    stepPipes(pipeX1, gapY1, passed1);
-    stepPipes(pipeX2, gapY2, passed2);
+    stepPipe(pipeX1, gapY1, passed1);
+    stepPipe(pipeX2, gapY2, passed2);
 
-    // Ground / ceiling
     if (birdY < 0) birdY = 0;
+
     if (birdY > SCREEN_HEIGHT - BIRD_SIZE) {
-      // hit ground => reset like flappy
       reset();
       return;
     }
 
-    // Score when passing pipes
     if (!passed1 && pipeX1 + PIPE_W < BIRD_X) { score++; passed1 = true; }
     if (!passed2 && pipeX2 + PIPE_W < BIRD_X) { score++; passed2 = true; }
 
-    // Collisions
     if (collidePipe(pipeX1, gapY1) || collidePipe(pipeX2, gapY2)) {
       reset();
       return;
@@ -363,30 +314,24 @@ struct Flappy {
   void drawPipe(int pipeX, int gapY) {
     int topH = gapY - (GAP_H / 2);
     int botY = gapY + (GAP_H / 2);
-
     if (topH < 0) topH = 0;
     if (botY > SCREEN_HEIGHT) botY = SCREEN_HEIGHT;
 
-    // top pipe
     display.fillRect(pipeX, 0, PIPE_W, topH, SSD1306_WHITE);
-    // bottom pipe
     display.fillRect(pipeX, botY, PIPE_W, SCREEN_HEIGHT - botY, SSD1306_WHITE);
   }
 
   void render() {
     display.clearDisplay();
 
-    // Score
     display.setTextSize(1);
     display.setCursor(0, 0);
     display.print("Score:");
     display.print(score);
 
-    // Pipes
     drawPipe(pipeX1, gapY1);
     drawPipe(pipeX2, gapY2);
 
-    // Bird
     display.fillRect(BIRD_X, (int)birdY, BIRD_SIZE, BIRD_SIZE, SSD1306_WHITE);
 
     display.display();
@@ -395,11 +340,9 @@ struct Flappy {
 
 Flappy flappy;
 
-void flappyStartNewGame() {
-  flappy.reset();
-}
+void flappyStartNewGame() { flappy.reset(); }
 
-// ===================== Menu rendering =====================
+// ===================== Menus =====================
 const char* gameName(GameId g) {
   switch (g) {
     case GAME_PONG:   return "PONG";
@@ -418,13 +361,13 @@ void renderMainMenu() {
 
   display.setTextSize(1);
   display.setCursor(10, 30);
-  display.print("Select: ");
+  display.print("Selected: ");
   display.print(gameName(selectedGame));
 
   display.setCursor(10, 44);
-  display.print("Short: next game");
+  display.print("SELECT: next game");
   display.setCursor(10, 54);
-  display.print("Long : open menu");
+  display.print("START : open menu");
 
   display.display();
 }
@@ -439,20 +382,18 @@ void renderGameMenu(GameId g) {
 
   display.setTextSize(1);
   display.setCursor(10, 30);
-display.print("Short: START game");
-display.setCursor(10, 44);
-display.print("Long : MAIN menu");
+  display.print("SELECT: START game");
+  display.setCursor(10, 44);
+  display.print("START : MAIN menu");
 
-  // small hint
   if (g == GAME_FLAPPY) {
     display.setCursor(10, 56);
-    display.print("Jump: pot delta >=500");
+    display.print("In game: SELECT = flap");
   }
 
   display.display();
 }
 
-// ===================== App flow =====================
 void enterMainMenu() {
   screenState = MAIN_MENU;
   activeGame = selectedGame;
@@ -471,10 +412,11 @@ void startGame(GameId g) {
   if (g == GAME_FLAPPY) flappyStartNewGame();
 }
 
-// ===================== Setup/Loop =====================
+// ===================== Timing =====================
 unsigned long lastFrameMs = 0;
 const unsigned long FRAME_MS = 16;
 
+// ===================== Setup/Loop =====================
 void setup() {
   randomSeed((uint32_t)micros());
 
@@ -483,18 +425,19 @@ void setup() {
     for(;;) delay(10);
   }
 
-  btn.begin(START_BTN_PIN);
+  btnStart.begin(START_BTN_PIN);
+  btnSelect.begin(SELECT_BTN_PIN);
 
-  // Start at main menu
   screenState = MAIN_MENU;
   selectedGame = GAME_PONG;
   activeGame = GAME_PONG;
 }
 
 void loop() {
-  // ---- Read inputs
-  BtnEvent ev = btn.update();
+  BtnEvent evStart  = btnStart.update();
+  BtnEvent evSelect = btnSelect.update();
 
+  // read pots
   rawL = analogRead(POT_LEFT_PIN);
   rawR = analogRead(POT_RIGHT_PIN);
 
@@ -502,27 +445,29 @@ void loop() {
   rawL = applyDeadband(rawL, lastL);
   rawR = applyDeadband(rawR, lastR);
 
-  // ---- Handle events based on state
+  // MAIN MENU
   if (screenState == MAIN_MENU) {
-    if (ev == BTN_SHORT) {
+    if (evSelect == BTN_SHORT) {
       selectedGame = (GameId)((selectedGame + 1) % GAME_COUNT);
-    } else if (ev == BTN_LONG) {
+    }
+    if (evStart == BTN_SHORT || evStart == BTN_LONG) {
       enterGameMenu(selectedGame);
     }
-
     renderMainMenu();
     delay(20);
     return;
   }
 
+  // GAME MENU
   if (screenState == GAME_MENU) {
-    if (ev == BTN_SHORT) {
-      startGame(activeGame);   // SHORT starts the game
+    if (evStart == BTN_SHORT || evStart == BTN_LONG) {
+      enterMainMenu();
+      renderMainMenu();
       delay(80);
       return;
-    } else if (ev == BTN_LONG) {
-      enterMainMenu();         // LONG returns to main menu
-      renderMainMenu();
+    }
+    if (evSelect == BTN_SHORT || evSelect == BTN_LONG) {
+      startGame(activeGame);
       delay(80);
       return;
     }
@@ -531,19 +476,19 @@ void loop() {
     return;
   }
 
-  // IN_GAME:
-  // - short: go to game menu
-  // - long : go to main menu
+  // IN GAME
   if (screenState == IN_GAME) {
-    if (ev == BTN_SHORT) {
-      enterGameMenu(activeGame);
-      renderGameMenu(activeGame);
-      delay(80);
-      return;
-    } else if (ev == BTN_LONG) {
+    // START long => main menu, START short => game menu
+    if (evStart == BTN_LONG) {
       enterMainMenu();
       renderMainMenu();
-      delay(80);
+      delay(120);
+      return;
+    }
+    if (evStart == BTN_SHORT) {
+      enterGameMenu(activeGame);
+      renderGameMenu(activeGame);
+      delay(120);
       return;
     }
 
@@ -552,16 +497,17 @@ void loop() {
     if (now - lastFrameMs < FRAME_MS) return;
     lastFrameMs = now;
 
-    // update + render per game
     if (activeGame == GAME_PONG) {
       pongUpdate();
       pongRender();
     } else if (activeGame == GAME_FLAPPY) {
-      // Flappy uses LEFT pot only
-      flappy.update(rawL);
+      // SELECT flaps
+      if (evSelect == BTN_SHORT || evSelect == BTN_LONG) {
+        flappy.flap();
+      }
+      flappy.update();
       flappy.render();
     }
-
     return;
   }
 }
